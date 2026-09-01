@@ -3,7 +3,7 @@
 # Amnezia, ядерный модуль, конфиг интерфейса с полной обфускацией и утилита
 # управления клиентами amwg. Ни докера, ни userspace-реализации на go.
 #
-#   curl -fsSL <raw>/install.sh | bash -s -- --endpoint 1.2.3.4
+#   curl -fsSL https://raw.githubusercontent.com/nikoano/niko-amwg/master/install.sh | bash -s -- --endpoint 1.2.3.4
 #   bash install.sh --port 443 --subnet 10.9.9.0/24 --client phone
 #
 # Скрипт НЕинтерактивный: при запуске через пайп спрашивать нечего, всё задаётся
