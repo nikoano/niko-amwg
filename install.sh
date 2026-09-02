@@ -35,6 +35,8 @@ port_explicit=false
 subnet="${AWG_SUBNET:-10.9.9.0/24}"
 dns="${AWG_DNS:-1.1.1.1,1.0.0.1}"
 endpoint="${AWG_ENDPOINT:-}"
+endpoint_explicit=false
+[ -n "${AWG_ENDPOINT:-}" ] && endpoint_explicit=true
 wan="${AWG_WAN:-}"
 client_mtu="${AWG_CLIENT_MTU:-1280}"
 keepalive="${AWG_KEEPALIVE:-25}"
@@ -81,6 +83,8 @@ usage() {
   --force-config       перегенерить конфиг интерфейса (все клиенты пойдут перевыпускаться)
   --no-ask             не спрашивать адрес даже в живой консоли
   --amwg PATH|URL      откуда взять amwg.py
+  --update             обновить только amwg, хелпер и юниты из репозитория;
+                       пакеты, конфиг, клиентов и интерфейс не трогает
   --uninstall --yes    снести всё поставленное (с бэкапом ключей в /root)
   --purge              вместе с --uninstall снести и пакеты amneziawg
 USAGE
@@ -101,7 +105,7 @@ die() { printf '%s  xx%s %s\n' "$c_red" "$c_off" "$*" >&2; exit 1; }
 
 while [ $# -gt 0 ]; do
 	case "$1" in
-	--endpoint) endpoint=$2; shift 2 ;;
+	--endpoint) endpoint=$2; endpoint_explicit=true; shift 2 ;;
 	--port) port=$2; port_explicit=true; shift 2 ;;
 	--iface) iface=$2; shift 2 ;;
 	--subnet) subnet=$2; shift 2 ;;
@@ -121,6 +125,7 @@ while [ $# -gt 0 ]; do
 	--no-stats-timer) stats_timer=false; shift ;;
 	--force-config) force_config=true; shift ;;
 	--no-ask) ask_input=false; shift ;;
+	--update) action=update; shift ;;
 	--uninstall) action=uninstall; shift ;;
 	--purge) purge_packages=true; shift ;;
 	--yes|-y) assume_yes=true; shift ;;
@@ -182,6 +187,39 @@ do_uninstall() {
 		DEBIAN_FRONTEND=noninteractive apt-get purge -y amneziawg amneziawg-dkms amneziawg-tools >/dev/null || true
 	fi
 	ok "снесено"
+	exit 0
+}
+
+# ============================================================================
+#  Обновление уже установленного
+# ============================================================================
+# Всё, что кладёт установщик кроме пакетов, генерируется им же: сама утилита,
+# хелпер модуля, три юнита и дроп-ин. Значит «подтянуть свежую версию из репо» —
+# это переложить их заново, ничего больше не трогая. Конфиг интерфейса, клиенты
+# и сам интерфейс остаются как есть, перезапускать ничего не надо.
+do_update() {
+	need_root
+	local state="$CONF_DIR/amwg/state.json"
+	[ -f "$state" ] || die "тут ничего не установлено — нужна обычная установка, а не --update"
+	iface=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["iface"])' "$state") ||
+		die "не читается $state"
+	# бэкенд определяем по факту, чтобы положить правильный дроп-ин
+	if [ ! -e /sys/module/amneziawg ] && command -v amneziawg-go >/dev/null 2>&1; then
+		userspace=true
+	fi
+	conf="$CONF_DIR/$iface.conf"
+
+	step "обновление из репозитория"
+	install_amwg
+	if $userspace; then
+		info "бэкенд userspace: ensure-module не нужен"
+	else
+		install_ensure_module
+	fi
+	install_restart_dropin
+	if $stats_timer; then install_stats_timer; fi
+	ok "интерфейс $iface, конфиг и клиенты не тронуты"
+	info "проверить: amwg check"
 	exit 0
 }
 
@@ -306,9 +344,18 @@ install_from_repo_debs() {
 # сетевая неурядица выглядела одинаково — «не склонировался». GIT_TERMINAL_PROMPT=0
 # отдельно: без него git на неудаче лезет спрашивать логин и вешает установку.
 git_clone() {
-	local err
-	err=$(GIT_TERMINAL_PROMPT=0 git clone --depth 1 "$1" "$2" 2>&1) ||
-		die "не склонировался $1: $(printf '%s' "$err" | tail -1)"
+	local err attempt=1
+	# github иногда рвёт сессию на середине («expected flush after ref listing»),
+	# и одна неудача не повод валить установку целиком
+	while [ $attempt -le 3 ]; do
+		rm -rf "$2"
+		if err=$(GIT_TERMINAL_PROMPT=0 git clone --depth 1 "$1" "$2" 2>&1); then
+			return 0
+		fi
+		attempt=$((attempt + 1))
+		sleep 2
+	done
+	die "не склонировался $1: $(printf '%s' "$err" | tail -1)"
 }
 
 install_userspace_go() {
@@ -870,6 +917,7 @@ INFO
 main() {
 	need_root
 	[ "$action" = uninstall ] && do_uninstall
+	[ "$action" = update ] && do_update
 	command -v apt-get >/dev/null ||
 		die "поддерживаются apt-дистрибутивы; на RHEL/Fedora: dnf copr enable amneziavpn/amneziawg && dnf install amneziawg-dkms amneziawg-tools, дальше конфиг руками по README"
 
@@ -942,8 +990,14 @@ main() {
 		amwg init --iface "$iface" --endpoint "$endpoint:$port" --subnet "$subnet" \
 			--server-ip "$server_ip" --dns "$dns" --mtu "$client_mtu" \
 			--keepalive "$keepalive" --allowed-ips "$allowed_ips"
-	else
+	elif $endpoint_explicit; then
 		amwg server --endpoint "$endpoint:$port" >/dev/null
+		info "адрес сервера обновлён на $endpoint:$port — клиентам нужны новые конфиги"
+	else
+		# адрес не передавали: трогать нельзя. Он мог быть доменом, а мы бы молча
+		# подставили найденный ip (да ещё и с портом по умолчанию) — и выданные
+		# конфиги начали бы указывать не туда
+		info "адрес сервера не трогаю: $(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["endpoint"])' "$CONF_DIR/amwg/state.json" 2>/dev/null)"
 		info "клиенты на месте: $(amwg list --json | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))') шт."
 	fi
 	if $stats_timer; then install_stats_timer; fi

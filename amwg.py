@@ -51,6 +51,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import ipaddress
 import json
 import os
@@ -59,7 +60,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import struct
 import time
+import zlib
 from datetime import datetime, timezone
 
 CONF_DIR = os.environ.get("AMWG_CONF_DIR", "/etc/amnezia/amneziawg")
@@ -719,11 +722,27 @@ def status_cell(row: dict) -> str:
 # ============================================================================
 #  QR и выдача конфига
 # ============================================================================
+def config_link(text: str) -> str:
+    """`vpn://…` — то, что официальный клиент Amnezia принимает в поле «вставить
+    ключ» рядом с файлом и qr.
+
+    Формат разобран по `importController.cpp` клиента: с текста снимается
+    префикс `vpn://`, остаток декодируется base64 в url-варианте и без
+    выравнивающих `=`, затем `qUncompress` — а это zlib, перед которым лежит
+    четырёхбайтовый размер исходника (big endian). Внутри может быть что угодно,
+    что клиент опознаёт как конфиг, — в том числе обычный awg-конфиг, который мы
+    и кладём.
+    """
+    raw = text.encode()
+    packed = struct.pack(">I", len(raw)) + zlib.compress(raw, 9)
+    return "vpn://" + base64.urlsafe_b64encode(packed).decode().rstrip("=")
+
+
 def qr_available() -> bool:
     return shutil.which("qrencode") is not None
 
 
-def print_qr(text: str) -> None:
+def print_qr(text: str, force: bool = False) -> None:
     """QR в терминал. Конфиг с полным набором 3.1 — это ~800 байт, то есть код
     примерно в 100 модулей шириной. В окно на 80 колонок он не влезает и
     переносится, а перенесённый qr не читается ничем — поэтому ширина меряется и
@@ -736,14 +755,17 @@ def print_qr(text: str) -> None:
     if proc.returncode != 0 or not proc.stdout:
         raise AppError("qrencode не смог: "
                        + ((proc.stderr or "").strip() or "конфиг слишком большой для qr"))
-    sys.stdout.write(proc.stdout)
     width = max((visible_len(line) for line in proc.stdout.splitlines()), default=0)
     columns = shutil.get_terminal_size((100, 25)).columns
-    if width > columns:
-        print(yellow(f"qr шире окна на {width - columns} символов — он переносится и "
-                     f"не прочитается."))
-        print(yellow(f"разверни окно (нужно {width}) или уменьши шрифт, либо сохрани "
-                     f"картинкой: amwg show <имя> --png файл.png"))
+    if width > columns and not force:
+        # печатать заведомо порванный переносами qr бессмысленно: он не
+        # отсканируется ничем, а экран займёт целиком
+        print(yellow(f"qr не помещается: нужно {width} колонок, в окне {columns}."))
+        print("  разверни окно или уменьши шрифт (в терминале обычно Ctrl+-), потом ещё раз;")
+        print(f"  либо картинкой:  {bold('amwg show <имя> --png ~/имя.png')}")
+        print(grey("  (--qr-anyway напечатает как есть)"))
+        return
+    sys.stdout.write(proc.stdout)
 
 
 def save_qr_png(text: str, path: str) -> None:
@@ -754,20 +776,26 @@ def save_qr_png(text: str, path: str) -> None:
 
 
 def show_client(state: dict, name: str, *, qr: bool = False, png: str = "",
-                out: str = "") -> None:
+                out: str = "", link: bool = False, qr_anyway: bool = False) -> None:
     """Текст конфига печатается, когда не просили ничего другого: голый `show`
     должен что-то показать, а `show --png x.png` — не сыпать ключами в терминал."""
     text = client_config(state, name)
-    if not (out or png or qr):
+    # в qr и в ссылку комментарии не кладутся: они там не видны, а место занимают
+    # (и заодно тянут кириллицу в полезную нагрузку)
+    payload = "\n".join(line for line in text.splitlines()
+                        if not line.lstrip().startswith("#")).strip() + "\n"
+    if not (out or png or qr or link):
         print(bold(f"# {name}"))
         print(text)
+    if link:
+        print(config_link(payload))
     if qr:
-        print_qr(text)
+        print_qr(payload, force=qr_anyway)
     if out:
         write_secret(out, text)
         print(green(f"конфиг записан: {out} (0600)"))
     if png:
-        save_qr_png(text, png)
+        save_qr_png(payload, png)
         print(green(f"qr записан: {png} (0600)"))
 
 
@@ -1605,6 +1633,7 @@ def menu_share(state: dict) -> None:
         return
     name = names[0]
     actions = ["показать конфиг текстом", "qr-код в терминал",
+               "ссылка vpn:// (поле «вставить ключ» в клиенте Amnezia)",
                "сохранить .conf в файл", "сохранить qr в png"]
     chosen = pick(actions, f"{name}: что сделать")
     if chosen is None:
@@ -1613,8 +1642,10 @@ def menu_share(state: dict) -> None:
     if action == 0:
         show_client(state, name)
     elif action == 1:
-        print_qr(client_config(state, name))
+        show_client(state, name, qr=True)
     elif action == 2:
+        show_client(state, name, link=True)
+    elif action == 3:
         path = ask(f"путь [/root/{name}.conf]: ", f"/root/{name}.conf")
         show_client(state, name, out=path)
     else:
@@ -1744,13 +1775,16 @@ def cmd_add(args) -> int:
         print(yellow("приватного ключа нет — конфиг собирает клиент, параметры: "
                      "amwg server"))
         return 0
-    show_client(state, args.name, qr=args.qr, png=args.png or "", out=args.out or "")
+    show_client(state, args.name, qr=args.qr, png=args.png or "", out=args.out or "",
+                link=getattr(args, "link", False))
     return 0
 
 
 def cmd_show(args) -> int:
     state = load_state()
-    show_client(state, args.name, qr=args.qr, png=args.png or "", out=args.out or "")
+    # --qr-anyway сам по себе означает «печатай qr», отдельного --qr не требует
+    show_client(state, args.name, qr=args.qr or args.qr_anyway, png=args.png or "",
+                out=args.out or "", link=args.link, qr_anyway=args.qr_anyway)
     return 0
 
 
@@ -1869,6 +1903,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pubkey", default="", help="публичный ключ клиента: приватный "
                                                 "остаётся у него, сервер его не хранит")
     p.add_argument("--qr", action="store_true")
+    p.add_argument("--link", action="store_true", help="ссылка vpn:// вместо конфига")
     p.add_argument("--png", default="", help="сохранить qr картинкой")
     p.add_argument("--out", default="", help="сохранить конфиг в файл")
     p.set_defaults(func=cmd_add)
@@ -1876,6 +1911,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("show", help="конфиг клиента: текст, qr, файл")
     p.add_argument("name")
     p.add_argument("--qr", action="store_true")
+    p.add_argument("--qr-anyway", action="store_true",
+                   help="печатать qr, даже если он шире окна")
+    p.add_argument("--link", action="store_true",
+                   help="ссылка vpn:// для поля «вставить ключ» в клиенте Amnezia")
     p.add_argument("--png", default="")
     p.add_argument("--out", default="")
     p.set_defaults(func=cmd_show)
