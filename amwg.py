@@ -31,6 +31,11 @@
     amwg poll                         копит трафик (юнит amwg-poll.timer)
     amwg server [--endpoint host:port] [--dns ...] [--mtu N] [--keepalive N]
     amwg apply                        перегенерить [Peer] и синкнуть на интерфейс
+    amwg check                        диагностика: модуль, юниты, NAT, порт, пиры
+    amwg validate [файл]              ест ли установленная версия этот конфиг
+    amwg backup [файл]                весь сервер одним json (ключи внутри!)
+    amwg restore <файл>               раскатать его на другом сервере
+    amwg up | down | restart          интерфейс через systemctl
     amwg init ...                     первичный state.json (зовёт установщик)
 
 Всё требует root: конфиг интерфейса и ключи лежат 0600.
@@ -63,6 +68,7 @@ STATE_FILE = os.path.join(STATE_DIR, "state.json")
 TRAFFIC_FILE = os.path.join(STATE_DIR, "traffic.json")
 AWG = os.environ.get("AMWG_AWG_BIN", "awg")
 AWG_QUICK = os.environ.get("AMWG_AWG_QUICK_BIN", "awg-quick")
+AWG_GO = os.environ.get("AMWG_GO_BIN", "amneziawg-go")
 
 # Параметры обфускации, которые ОБЯЗАНЫ совпадать у сервера и клиента: копируются
 # в клиентский конфиг как есть. Список из README ядерного модуля — «All parameters
@@ -82,6 +88,12 @@ JUNK_KEYS = ("Jc", "Jmin", "Jmax")
 # Имя клиента уезжает в комментарий conf, в ключ json и в подсказки меню:
 # буквы (в том числе русские), цифры, точка, подчёркивание, дефис — и всё
 NAME_RE = re.compile(r"^\w[\w.-]{0,30}$", re.UNICODE)
+# Имя ТУННЕЛЯ в мобильных приложениях (и вайргардовском, и в форке Amnezia)
+# ограничено жёстче: NAME_MAX_LENGTH = 15 и [a-zA-Z0-9_=+.-]. На сервере имя может
+# быть любым — но если оно не проходит эту проверку, при импорте на телефоне
+# придётся придумывать другое, и связь «клиент в списке ↔ туннель в телефоне»
+# теряется. Поэтому не запрет, а предупреждение.
+CLIENT_APP_NAME_RE = re.compile(r"^[A-Za-z0-9_=+.-]{1,15}$")
 ONLINE_WINDOW_SEC = 180          # хендшейк раз в ~2 минуты, 3 минуты — уже «отвалился»
 
 
@@ -186,6 +198,10 @@ def run(args: list[str], *, input_text: str | None = None, check: bool = True) -
         proc = subprocess.run(args, input=input_text, text=True,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except FileNotFoundError as e:
+        # с check=False зовущий и так разбирает пустой ответ: отсутствие ufw или
+        # dkms — это факт для диагностики, а не повод падать
+        if not check:
+            return ""
         raise AppError(f"не найдено: {args[0]} ({e})") from e
     if check and proc.returncode != 0:
         err = (proc.stderr or proc.stdout or "").strip()
@@ -208,6 +224,68 @@ def genpsk() -> str:
 def iface_is_up(iface: str) -> bool:
     out = run([AWG, "show", "interfaces"], check=False)
     return iface in out.split()
+
+
+def tools_version() -> str:
+    """3.1.20260812 из `amneziawg-tools v3.1.20260812 - https://amnezia.org`."""
+    match = re.search(r"v([0-9][0-9.]*)", run([AWG, "--version"], check=False))
+    return match.group(1) if match else ""
+
+
+def module_version() -> str:
+    """Версия ПАКЕТА модуля, а не поколения протокола: в Makefile модуля зашито
+    WIREGUARD_VERSION = 1.0.0, и оно перебивает version.h с настоящим
+    3.1.20260812. Сравнивать её с 3.1 бессмысленно — годится только для отчёта,
+    а понимает ли ядро параметры 3.1, показывает validate_conf.
+
+    /sys/module читается первым: modinfo ищет ФАЙЛ модуля и ничего не скажет про
+    загруженный, но не установленный в /lib/modules."""
+    try:
+        with open("/sys/module/amneziawg/version", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return run(["modinfo", "-F", "version", "amneziawg"], check=False)
+
+
+def version_ge(have: str, want: str) -> bool:
+    """Сравнение по major.minor. Поколения мало: tools 3.0 не знают ключей
+    RandomTrailers и DisableCookies, и конфиг от 3.1 на них не применится."""
+    def pair(v: str) -> tuple[int, int]:
+        parts = (v.split(".") + ["0"])[:2]
+        try:
+            return int(parts[0]), int(parts[1])
+        except ValueError:
+            return -1, -1
+    got, need = pair(have), pair(want)
+    return got >= need if got != (-1, -1) else False
+
+
+def backend() -> str:
+    """Чем поднимается интерфейс: 'kernel' | 'userspace' | 'none'.
+
+    Определяется по факту, а не по записи в state: сервер могли перевести с
+    ядерного модуля на amneziawg-go и обратно, и утилита не должна про это
+    ничего помнить. Всё остальное для неё одинаково — `awg show`, `syncconf` и
+    `setconf` ходят и в netlink, и в unix-сокет go-реализации прозрачно.
+    """
+    if os.path.exists("/sys/module/amneziawg"):
+        return "kernel"
+    if shutil.which(AWG_GO):
+        return "userspace"
+    return "none"
+
+
+def systemctl(*args: str, check: bool = True) -> str:
+    return run(["systemctl", *args], check=check)
+
+
+def unit_state(unit: str) -> str:
+    """active/inactive/failed/not-found — одним словом, без исключений."""
+    out = run(["systemctl", "is-active", unit], check=False) or "unknown"
+    if out == "inactive" and run(["systemctl", "list-unit-files", unit],
+                                check=False).count(unit) == 0:
+        return "not-found"
+    return out
 
 
 def require_root() -> None:
@@ -386,6 +464,32 @@ def apply(state: dict) -> None:
 # ============================================================================
 #  Клиенты
 # ============================================================================
+def with_port(endpoint: str, state: dict) -> str:
+    """Дописывает порт из ListenPort, если его забыли.
+
+    Endpoint живёт только в клиентских конфигах, и сервер его не проверяет — а
+    клиент с `Endpoint = vpn.example.com` без порта просто не поднимется. Порт
+    берётся из конфига интерфейса, то есть из того самого места, куда клиент и
+    будет стучаться.
+    """
+    if not endpoint:
+        return endpoint
+    if endpoint.startswith("["):
+        if "]:" in endpoint:                     # [2001:db8::1]:443 — всё на месте
+            return endpoint
+    elif endpoint.count(":") == 1 and endpoint.rsplit(":", 1)[1].isdigit():
+        return endpoint
+    elif endpoint.count(":") > 1:                # голый ipv6: без скобок непонятно,
+        raise AppError(f"ipv6-адрес нужно в скобках: [{endpoint}]:<порт>")  # где порт
+
+    port = dict(parse_conf(conf_path(state))[0]).get("ListenPort", "")
+    if not port:
+        raise AppError(f"в '{endpoint}' нет порта, и ListenPort в конфиге не нашёлся — "
+                       f"укажи полностью: host:порт")
+    print(yellow(f"порт не указан — подставил {port} из ListenPort интерфейса"))
+    return f"{endpoint}:{port}"
+
+
 def check_name(name: str) -> str:
     if not NAME_RE.match(name):
         raise AppError(f"негодное имя '{name}': буквы, цифры, . _ -, до 31 символа")
@@ -434,6 +538,12 @@ def add_client(state: dict, name: str, note: str = "", ip: str = "",
     else:
         private = genkey()
         public = pubkey(private)
+
+    if not CLIENT_APP_NAME_RE.match(name):
+        print(yellow(f"имя '{name}' не пройдёт как имя туннеля в мобильном приложении "
+                     f"(там [a-zA-Z0-9_=+.-] и не длиннее 15)"))
+        print(grey("  на сервере оно останется как есть, но при импорте конфига "
+                   "телефон попросит другое"))
 
     client = {
         "ip": ip,
@@ -614,16 +724,26 @@ def qr_available() -> bool:
 
 
 def print_qr(text: str) -> None:
+    """QR в терминал. Конфиг с полным набором 3.1 — это ~800 байт, то есть код
+    примерно в 100 модулей шириной. В окно на 80 колонок он не влезает и
+    переносится, а перенесённый qr не читается ничем — поэтому ширина меряется и
+    про неё говорится прямо, а не «попробуйте отсканировать»."""
     if not qr_available():
         raise AppError("нет qrencode: apt install -y qrencode")
-    size = len(text.encode())
-    if size > 1200:
-        print(yellow(f"конфиг на {size} байт — qr выйдет плотным, телефон может "
-                     f"не взять с экрана; тогда --png файл"))
     proc = subprocess.run(["qrencode", "-t", "ANSIUTF8", "-l", "L", "-m", "1", "-o", "-"],
-                          input=text, text=True)
-    if proc.returncode != 0:
-        raise AppError("qrencode не смог: конфиг слишком большой для qr-кода")
+                          input=text, text=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0 or not proc.stdout:
+        raise AppError("qrencode не смог: "
+                       + ((proc.stderr or "").strip() or "конфиг слишком большой для qr"))
+    sys.stdout.write(proc.stdout)
+    width = max((visible_len(line) for line in proc.stdout.splitlines()), default=0)
+    columns = shutil.get_terminal_size((100, 25)).columns
+    if width > columns:
+        print(yellow(f"qr шире окна на {width - columns} символов — он переносится и "
+                     f"не прочитается."))
+        print(yellow(f"разверни окно (нужно {width}) или уменьши шрифт, либо сохрани "
+                     f"картинкой: amwg show <имя> --png файл.png"))
 
 
 def save_qr_png(text: str, path: str) -> None:
@@ -732,8 +852,13 @@ def print_server(state: dict) -> None:
     pairs, _ = parse_conf(path)
     server = dict(pairs)
     up = iface_is_up(state["iface"])
-    tools = run([AWG, "--version"], check=False) or "?"
-    module = run(["modinfo", "-F", "version", "amneziawg"], check=False) or "нет (userspace?)"
+    tools = tools_version() or "?"
+    kind = backend()
+    module = {
+        "kernel": f"ядерный модуль, версия пакета {module_version() or '?'} (не поколение)",
+        "userspace": "amneziawg-go: " + (
+            run([AWG_GO, "--version"], check=False).splitlines() or ["?"])[0].strip(),
+    }.get(kind, "нет ни модуля, ни amneziawg-go")
 
     print(bold(f"интерфейс {state['iface']}") + "  " +
           (green("поднят") if up else red("лежит")))
@@ -747,7 +872,7 @@ def print_server(state: dict) -> None:
     print(f"  клиентов      : {len(state['clients'])} "
           f"(включённых {sum(1 for c in state['clients'].values() if c.get('enabled', True))})")
     print(f"  awg           : {tools}")
-    print(f"  модуль ядра   : {module}")
+    print(f"  реализация    : {module}")
     print()
     print(bold("обфускация (в клиентские конфиги копируется как есть)"))
     for key in JUNK_KEYS:
@@ -1038,6 +1163,405 @@ def confirm(prompt: str) -> bool:
 
 
 # ============================================================================
+#  Бэкап, восстановление, диагностика
+# ============================================================================
+BACKUP_FORMAT = 1
+NEEDED_VERSION = "3.1"          # ниже конфиги с RandomTrailers/DisableCookies не встанут
+
+
+def make_backup(state: dict) -> dict:
+    """Весь сервер в ОДНОМ json: конфиг интерфейса текстом, клиенты с ключами,
+    накопленный трафик и версии, при которых всё это работало.
+
+    Один файл, а не тар, сознательно: его удобно унести scp'ом, положить в
+    менеджер паролей и восстановить одной командой. Внутри приватные ключи —
+    и сервера, и всех клиентов, так что файл 0600 и обращение как с ключом.
+    """
+    with open(conf_path(state), encoding="utf-8") as f:
+        conf = f.read()
+    return {
+        "format": BACKUP_FORMAT,
+        "created": now_iso(),
+        "host": os.uname().nodename,
+        "generation": NEEDED_VERSION,
+        "versions": {"tools": tools_version(), "module": module_version()},
+        "conf_path": conf_path(state),
+        "conf": conf,
+        "state": state,
+        "traffic": load_traffic(),
+    }
+
+
+def default_backup_path() -> str:
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return f"/root/amwg-backup-{os.uname().nodename}-{stamp}.json"
+
+
+def cmd_backup(args) -> int:
+    state = load_state()
+    data = make_backup(state)
+    text = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    if args.path == "-":
+        sys.stdout.write(text)
+        return 0
+    path = args.path or default_backup_path()
+    write_secret(path, text)
+    print(green(f"бэкап: {path}"))
+    print(f"  клиентов {len(state['clients'])}, конфиг интерфейса, трафик, версии")
+    print(grey("  внутри приватные ключи сервера и всех клиентов — файл 0600, "
+               "хранить как ключ"))
+    return 0
+
+
+def cmd_restore(args) -> int:
+    raw = sys.stdin.read() if args.path == "-" else open(args.path, encoding="utf-8").read()
+    try:
+        data = json.loads(raw)
+    except ValueError as e:
+        raise AppError(f"это не бэкап amwg: {e}") from e
+    if data.get("format") != BACKUP_FORMAT and not args.force:
+        raise AppError(f"формат бэкапа {data.get('format')}, а я умею {BACKUP_FORMAT} "
+                       f"(--force — всё равно раскатать)")
+    state = data.get("state") or {}
+    conf = data.get("conf") or ""
+    if not state.get("iface") or not conf:
+        raise AppError("в бэкапе нет ни конфига интерфейса, ни клиентов")
+
+    # Версия на ЭТОМ сервере должна быть не ниже той, при которой бэкап снят:
+    # иначе конфиг с параметрами 3.1 не применится, и клиенты не подключатся
+    # Сверяется ТОЛЬКО версия tools: у модуля версия пакетная (1.0.0 у любой
+    # сборки), сравнивать её не с чем. Понимает ли ядро параметры из бэкапа,
+    # видно из amwg validate сразу после раскатки.
+    was = (data.get("versions") or {}).get("tools", "")
+    now_tools = tools_version()
+    want = was or NEEDED_VERSION
+    if not (now_tools and version_ge(now_tools, want)):
+        message = f"amneziawg-tools тут {now_tools or 'не найден'}, а бэкап снят при {want}"
+        if not args.force:
+            raise AppError(message + " — конфиги клиентов не заведутся (--force — "
+                                     "раскатать как есть)")
+        print(yellow(f"  !! {message}"))
+
+    target = os.path.join(CONF_DIR, f"{state['iface']}.conf")
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    for path in (target, STATE_FILE, TRAFFIC_FILE):
+        if os.path.exists(path):
+            os.replace(path, f"{path}.bak-{stamp}")
+            print(grey(f"  прежний {os.path.basename(path)} → .bak-{stamp}"))
+
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    write_secret(target, conf)
+    if args.endpoint:
+        state["endpoint"] = with_port(args.endpoint, state)
+    save_state(state)
+    write_secret(TRAFFIC_FILE,
+                 json.dumps(data.get("traffic") or {"peers": {}},
+                            ensure_ascii=False, indent=2) + "\n")
+    write_conf(state)
+    print(green(f"раскатано: {len(state.get('clients', {}))} клиентов, "
+                f"интерфейс {state['iface']}, endpoint {state['endpoint']}"))
+
+    unit = f"awg-quick@{state['iface']}"
+    if args.no_restart:
+        print(yellow(f"  интерфейс не трогал: systemctl restart {unit}"))
+    elif unit_state(unit) == "not-found":
+        print(yellow(f"  юнита {unit} тут нет — сперва install.sh"))
+    else:
+        systemctl("restart", unit)
+        print(green(f"  {unit} перезапущен"))
+    if not args.endpoint:
+        print(grey("  адрес сервера взят из бэкапа; сменился — "
+                   "amwg server --endpoint host:port и раздать конфиги заново"))
+    return 0
+
+
+def cmd_up(args) -> int:
+    state = load_state()
+    systemctl("start", f"awg-quick@{state['iface']}")
+    print(green(f"интерфейс {state['iface']} поднят"))
+    return 0
+
+
+def cmd_down(args) -> int:
+    state = load_state()
+    systemctl("stop", f"awg-quick@{state['iface']}")
+    print(yellow(f"интерфейс {state['iface']} опущен — клиенты отвалились"))
+    return 0
+
+
+def cmd_restart(args) -> int:
+    state = load_state()
+    systemctl("restart", f"awg-quick@{state['iface']}")
+    print(green(f"интерфейс {state['iface']} перезапущен (сессии оборвались; "
+                f"чтобы без разрыва — amwg apply)"))
+    return 0
+
+
+# ── проверка конфига на временном интерфейсе ───────────────────────────
+TEST_IFACE = "amwgvalid0"
+
+
+def validate_conf(path: str) -> str:
+    """Скармливает конфиг ядру на ВРЕМЕННОМ интерфейсе и возвращает описание того,
+    что проверено. Ошибка — AppError с текстом от самого awg.
+
+    Живой awg0 при этом не трогается вообще. Проверяются обе стадии, на которых
+    конфиг может не подойти: разбор в amneziawg-tools (неизвестный ключ = отказ,
+    так ловится «новая версия выкинула параметр») и правила ядра — S1-S4 не ниже
+    12 при защите заголовков, непересечение диапазонов H1-H4.
+
+    awg-quick strip требует, чтобы файл назывался <интерфейс>.conf, поэтому
+    конфиг сперва кладётся под подходящим именем в /run (tmpfs, 0600 — внутри
+    приватный ключ).
+    """
+    if not os.path.exists(path):
+        raise AppError(f"нет файла {path}")
+    kind = backend()
+    if kind == "none":
+        raise AppError("нет ни ядерного модуля, ни amneziawg-go — проверять нечем "
+                       "(modprobe amneziawg, потом ещё раз)")
+
+    base = "/run" if os.path.isdir("/run") else tempfile.gettempdir()
+    work = tempfile.mkdtemp(dir=base, prefix="amwgval-")
+    copy = os.path.join(work, "amwgval.conf")
+    try:
+        with open(path, encoding="utf-8") as src:
+            write_secret(copy, src.read())
+        stripped = run([AWG_QUICK, "strip", copy])
+        # ListenPort выкидывается: временный интерфейс иначе дерётся за порт с
+        # работающим и падает с «Address already in use». Слушается ли порт
+        # на самом деле — отдельная проверка в check
+        probe = "\n".join(line for line in stripped.splitlines()
+                           if not line.strip().lower().startswith("listenport"))
+        flat = os.path.join(work, "flat.conf")
+        write_secret(flat, probe + "\n")
+
+        run(["ip", "link", "del", TEST_IFACE], check=False)
+        if kind == "userspace":
+            run([AWG_GO, TEST_IFACE])       # демонизируется и гаснет с интерфейсом
+        else:
+            run(["ip", "link", "add", TEST_IFACE, "type", "amneziawg"])
+        try:
+            run([AWG, "setconf", TEST_IFACE, flat])
+            peers = probe.count("[Peer]")
+            keys = sum(1 for line in probe.splitlines()
+                       if line.split("=")[0].strip() in COPY_KEYS + JUNK_KEYS)
+            where = "ядром" if kind == "kernel" else "amneziawg-go"
+            return (f"конфиг принят {where}: {keys} параметров обфускации, "
+                    f"пиров {peers}")
+        finally:
+            run(["ip", "link", "del", TEST_IFACE], check=False)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def cmd_validate(args) -> int:
+    path = args.path
+    if not path:
+        path = conf_path(load_state())
+    print(f"проверяю {path} на временном интерфейсе {TEST_IFACE}")
+    print(green("  ok  ") + validate_conf(path))
+    kind = backend()
+    where = (f"модуль {module_version() or '?'}" if kind == "kernel" else
+             "amneziawg-go" if kind == "userspace" else "бэкенда нет")
+    print(grey(f"  версии тут: tools {tools_version() or '?'}, {where}"))
+    return 0
+
+
+# ── диагностика ─────────────────────────────────────────────────────────
+class Report:
+    """Простыня проверок с итоговым кодом возврата: fail — что-то не работает
+    прямо сейчас, warn — работает, но однажды сломается."""
+
+    def __init__(self) -> None:
+        self.fails = 0
+        self.warns = 0
+
+    def ok(self, title: str, detail: str = "") -> None:
+        print(f"  {green('ok')}  {title}" + (grey(f"  {detail}") if detail else ""))
+
+    def warn(self, title: str, detail: str = "") -> None:
+        self.warns += 1
+        print(f"  {yellow('!!')}  {title}" + (grey(f"  {detail}") if detail else ""))
+
+    def fail(self, title: str, detail: str = "") -> None:
+        self.fails += 1
+        print(f"  {red('xx')}  {title}" + (grey(f"  {detail}") if detail else ""))
+
+
+def check_module(rep: Report) -> None:
+    release = os.uname().release
+    kind = backend()
+    if kind == "userspace":
+        rep.ok("бэкенд: amneziawg-go (userspace)",
+               run([AWG_GO, "--version"], check=False).splitlines()[0].strip())
+        if not os.path.exists("/dev/net/tun"):
+            rep.fail("нет /dev/net/tun — go-реализации не на чем работать")
+    elif kind == "kernel":
+        # версия модуля тут только для отчёта: она пакетная (1.0.0 у любой
+        # сборки), а поколение проверяется применением конфига — check_config
+        rep.ok(f"модуль загружен, ядро {release}",
+               f"пакетная версия {module_version() or '?'}")
+    elif module_version():
+        rep.fail("модуль есть, но не загружен", "modprobe amneziawg")
+    else:
+        rep.fail("нет ни модуля, ни amneziawg-go", "dkms status; journalctl -k | tail")
+
+    tools = tools_version()
+    if not tools:
+        rep.fail("awg не отвечает на --version")
+    elif not version_ge(tools, NEEDED_VERSION):
+        rep.fail(f"amneziawg-tools {tools}, нужно {NEEDED_VERSION}+",
+                 "тут нет RandomTrailers/DisableCookies")
+    else:
+        rep.ok(f"amneziawg-tools {tools}")
+
+    if kind == "userspace":
+        return              # dkms и заголовки ядра тут ни при чём
+    if os.path.isdir(f"/lib/modules/{release}/build"):
+        rep.ok("заголовки текущего ядра на месте")
+    else:
+        rep.fail(f"нет /lib/modules/{release}/build",
+                 "dkms нечем собирать: apt install linux-headers-$(uname -r)")
+
+    dkms = run(["dkms", "status", "-m", "amneziawg"], check=False)
+    if not dkms:
+        rep.warn("dkms про amneziawg ничего не знает", "модуль собран вручную?")
+    elif release in dkms and "installed" in dkms:
+        rep.ok("dkms: модуль собран под текущее ядро")
+    else:
+        rep.warn("dkms: под текущее ядро сборки нет",
+                 "после ребута vpn не поднимется; systemctl start amwg-ensure-module")
+
+
+def check_units(rep: Report, state: dict) -> None:
+    units = [(f"awg-quick@{state['iface']}.service", True), ("amwg-poll.timer", False)]
+    if backend() != "userspace":
+        # в userspace пересобирать под новое ядро нечего, юнита нет и не должно быть
+        units.insert(1, ("amwg-ensure-module.service", False))
+    for unit, needed in units:
+        status = unit_state(unit)
+        if status == "active":
+            rep.ok(f"{unit}: active")
+        elif status == "not-found":
+            (rep.fail if needed else rep.warn)(f"{unit}: юнита нет")
+        elif status == "failed":
+            (rep.fail if needed else rep.warn)(f"{unit}: failed",
+                                               f"journalctl -u {unit} -n 30")
+        else:
+            (rep.fail if needed else rep.ok)(f"{unit}: {status}")
+    enabled = run(["systemctl", "is-enabled", f"awg-quick@{state['iface']}"], check=False)
+    if enabled != "enabled":
+        rep.warn(f"awg-quick@{state['iface']} не в автозапуске ({enabled or '?'})")
+
+
+def check_network(rep: Report, state: dict) -> None:
+    iface = state["iface"]
+    if not iface_is_up(iface):
+        rep.fail(f"интерфейса {iface} нет в ядре", f"systemctl status awg-quick@{iface}")
+        return
+    rep.ok(f"интерфейс {iface} поднят")
+
+    forward = ""
+    try:
+        with open("/proc/sys/net/ipv4/ip_forward", encoding="utf-8") as f:
+            forward = f.read().strip()
+    except OSError:
+        pass
+    (rep.ok if forward == "1" else rep.fail)(
+        f"net.ipv4.ip_forward = {forward or '?'}",
+        "" if forward == "1" else "трафик клиентов никуда не пойдёт")
+
+    nat = run(["iptables", "-t", "nat", "-S", "POSTROUTING"], check=False)
+    if state["subnet"] in nat and "MASQUERADE" in nat:
+        rep.ok(f"NAT для {state['subnet']} на месте")
+    else:
+        rep.fail("нет правила MASQUERADE для подсети",
+                 "PostUp не отработал: поднимай через awg-quick, а не ip link")
+
+    pairs, _ = parse_conf(conf_path(state))
+    port = dict(pairs).get("ListenPort", "")
+    listening = run(["ss", "-lunH"], check=False)
+    if port and re.search(rf"[:.]{port}\s", listening):
+        rep.ok(f"порт {port}/udp слушается")
+    elif port:
+        rep.fail(f"порт {port}/udp никто не слушает")
+
+    kind, opened = firewall_state(port)
+    if not kind:
+        rep.ok("локального фильтра нет", "снаружи может резать облачная security group")
+    elif opened:
+        rep.ok(f"{kind}: порт {port}/udp разрешён")
+    else:
+        rep.warn(f"{kind} активен, а {port}/udp в правилах не вижу",
+                 "открыть руками — установщик фаервол не трогает")
+
+
+def firewall_state(port: str) -> tuple[str, bool]:
+    """Какой фильтр стоит и виден ли в нём наш порт. Установщик фаервол не
+    трогает, так что это единственное место, где про него вообще известно;
+    распознавание грубое (правило с диапазоном портов не опознается), поэтому
+    ответ идёт предупреждением, а не поломкой."""
+    ufw = run(["ufw", "status"], check=False)
+    if "Status: active" in ufw:
+        return "ufw", port in ufw
+    if run(["firewall-cmd", "--state"], check=False) == "running":
+        return "firewalld", f"{port}/udp" in run(["firewall-cmd", "--list-ports"], check=False)
+    nft = run(["nft", "list", "ruleset"], check=False)
+    if "hook input" in nft:
+        return "nftables", port in nft
+    ipt = run(["iptables", "-S", "INPUT"], check=False)
+    if re.search(r"^-P INPUT DROP|^-A INPUT", ipt, re.M):
+        return "iptables", f"--dport {port}" in ipt
+    return "", True
+
+
+def check_clients(rep: Report, state: dict) -> None:
+    if not iface_is_up(state["iface"]):
+        return          # про лежащий интерфейс уже сказано выше, сверять не с чем
+    live = set(dump_peers(state))
+    want = {c["pubkey"] for c in state["clients"].values() if c.get("enabled", True)}
+    if live == want:
+        rep.ok(f"пиры: {len(want)} включённых, все в ядре")
+    else:
+        missing, extra = want - live, live - want
+        rep.fail(f"конфиг и ядро разъехались: нет в ядре {len(missing)}, "
+                 f"лишних {len(extra)}", "amwg apply")
+    if not state.get("endpoint"):
+        rep.warn("не задан endpoint", "amwg server --endpoint host:port")
+
+
+def check_config(rep: Report, state: dict) -> None:
+    """Ест ли установленная версия текущий конфиг. Отдельный смысл появляется
+    после обновления пакетов: интерфейс может быть ещё поднят старым модулем, а
+    конфиг новому уже не подходить — узнать об этом до рестарта дешевле."""
+    try:
+        rep.ok(validate_conf(conf_path(state)))
+    except AppError as e:
+        rep.fail("конфиг не принимается", str(e))
+
+
+def cmd_check(args) -> int:
+    state = load_state()
+    print(bold(f"amwg check · {state['iface']} · {state.get('endpoint', '?')}"))
+    rep = Report()
+    check_module(rep)
+    check_units(rep, state)
+    check_network(rep, state)
+    check_clients(rep, state)
+    check_config(rep, state)
+    print()
+    if rep.fails:
+        print(red(f"поломок: {rep.fails}") + (f", предупреждений: {rep.warns}" if rep.warns else ""))
+        return 1
+    if rep.warns:
+        print(yellow(f"работает, но есть о чём подумать: {rep.warns}"))
+        return 0
+    print(green("всё в порядке"))
+    return 0
+
+
+# ============================================================================
 #  Меню
 # ============================================================================
 def pause() -> None:
@@ -1135,6 +1659,8 @@ def menu(state: dict) -> None:
         "удалить клиента",
         "трафик в реальном времени",
         "сервер и параметры обфускации",
+        "диагностика",
+        "бэкап в файл",
         "выход",
     ]
     pos = 0
@@ -1159,6 +1685,15 @@ def menu(state: dict) -> None:
         elif pos == 6:
             print_server(state)
             pause()
+        elif pos == 7:
+            cmd_check(None)
+            pause()
+        elif pos == 8:
+            path = ask(f"куда [{default_backup_path()}]: ", default_backup_path())
+            write_secret(path, json.dumps(make_backup(state), ensure_ascii=False,
+                                          indent=2) + "\n")
+            print(green(f"бэкап: {path}"))
+            pause()
         else:
             return
 
@@ -1172,7 +1707,7 @@ def cmd_init(args) -> int:
     state = json.loads(json.dumps(DEFAULT_STATE))
     state.update({
         "iface": args.iface,
-        "endpoint": args.endpoint,
+        "endpoint": args.endpoint,      # порт дописывается ниже, когда известен conf
         "subnet": args.subnet,
         "server_ip": args.server_ip or str(next(
             ipaddress.ip_network(args.subnet, strict=False).hosts())),
@@ -1183,6 +1718,7 @@ def cmd_init(args) -> int:
         "clients": {},
     })
     os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    state["endpoint"] = with_port(state["endpoint"], state)
     state["server_pubkey"] = server_pubkey(state)
     save_state(state)
     print(green(f"разложено: {STATE_FILE}"))
@@ -1272,7 +1808,7 @@ def cmd_server(args) -> int:
     state = load_state()
     changed = False
     if args.endpoint:
-        state["endpoint"] = args.endpoint
+        state["endpoint"] = with_port(args.endpoint, state)
         changed = True
     if args.dns is not None:
         state["dns"] = [d.strip() for d in args.dns.split(",") if d.strip()]
@@ -1377,6 +1913,36 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--keepalive", type=int, default=None)
     p.add_argument("--allowed-ips", default="")
     p.set_defaults(func=cmd_server)
+
+    p = sub.add_parser("check", help="диагностика: модуль, юниты, NAT, порт, пиры")
+    p.set_defaults(func=cmd_check)
+
+    p = sub.add_parser("validate", help="проверить конфиг на временном интерфейсе")
+    p.add_argument("path", nargs="?", default="",
+                   help="файл; пусто — конфиг своего интерфейса")
+    p.set_defaults(func=cmd_validate)
+
+    p = sub.add_parser("backup", help="весь сервер одним json (ключи внутри!)")
+    p.add_argument("path", nargs="?", default="",
+                   help="файл; '-' — в stdout; пусто — /root/amwg-backup-<хост>-<дата>.json")
+    p.set_defaults(func=cmd_backup)
+
+    p = sub.add_parser("restore", help="раскатать бэкап на этом сервере")
+    p.add_argument("path", help="файл бэкапа или '-' для stdin")
+    p.add_argument("--endpoint", default="", help="подменить адрес сервера при раскатке")
+    p.add_argument("--no-restart", action="store_true", help="не трогать интерфейс")
+    p.add_argument("--force", action="store_true",
+                   help="раскатать, даже если версии тут ниже, чем в бэкапе")
+    p.set_defaults(func=cmd_restore)
+
+    p = sub.add_parser("up", help="поднять интерфейс")
+    p.set_defaults(func=cmd_up)
+
+    p = sub.add_parser("down", help="опустить интерфейс")
+    p.set_defaults(func=cmd_down)
+
+    p = sub.add_parser("restart", help="перезапустить интерфейс (рвёт сессии)")
+    p.set_defaults(func=cmd_restart)
 
     p = sub.add_parser("menu", help="интерактивное меню")
     p.set_defaults(func=cmd_menu)
