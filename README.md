@@ -473,7 +473,15 @@ bash install.sh --uninstall --yes --purge  # заодно снести паке�
   перезагрузились): после ребута всё встанет само, этим и занимается
   `amwg-ensure-module`;
 - **включён Secure Boot** — dkms-модуль надо подписать (`mokutil --import`) или
-  выключить SB; установщик про это скажет отдельно.
+  выключить SB; установщик про это скажет отдельно;
+- **`compat.h:1449: incompatible pointer type` в make.log** — ядро с бэкпортом
+  `setup_udp_tunnel_sock(struct sock *)` при старом номере версии (Ubuntu 26.04 и
+  HWE 24.04 на `7.0.0-38`, апстрим
+  [#259](https://github.com/amnezia-vpn/amneziawg-linux-kernel-module/issues/259)).
+  Установщик сам правит `compat.h` в `/usr/src/amneziawg-*` на проверку сигнатуры
+  при компиляции, так что исходник годится под любое ядро. Пакет обновили мимо
+  установщика — правка затёрлась: перезапусти `install.sh`, он поправит и
+  доконфигурит пакет.
 
 **Клиент подключился, а сайтов нет.** По порядку: `awg show awg0` (хендшейк
 есть?), `sysctl net.ipv4.ip_forward` (=1?), `iptables -t nat -L POSTROUTING -n`

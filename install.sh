@@ -279,6 +279,70 @@ install_headers() {
 	fi
 }
 
+# Ubuntu в 7.0.0-38 бэкпортнула из 7.1.5 смену setup_udp_tunnel_sock на struct sock *,
+# не тронув LINUX_VERSION_CODE, а udp_tunnel_sock_release оставила старой. compat.h
+# модуля решает по номеру версии и на таком ядре не компилируется (апстрим #259).
+# Проверку версии меняем на проверку самой сигнатуры при компиляции (как в
+# апстримном PR #265): исходник в /usr/src один на все ядра, под которые dkms его
+# соберёт, так что править по номеру ядра нельзя. Починят в апстриме — старого
+# блока не будет, и патч ничего не сделает.
+patch_kmod_compat() {
+	local f out
+	for f in "$@"; do
+		[ -f "$f" ] || continue
+		out=$(python3 - "$f" <<'PY'
+import sys
+
+path = sys.argv[1]
+old = """#if LINUX_VERSION_CODE < KERNEL_VERSION(7, 1, 5)
+#include <net/udp_tunnel.h>
+#define setup_udp_tunnel_sock(net, sk, sock_cfg) setup_udp_tunnel_sock(net, sk->sk_socket, sock_cfg)
+#define udp_tunnel_sock_release(sk) udp_tunnel_sock_release(sk->sk_socket)
+#endif
+"""
+new = """/* niko-amwg: signature probe instead of version check, see upstream #259/#265 */
+#include <net/udp_tunnel.h>
+
+static inline void __compat_setup_udp_tunnel_sock(struct net *net, struct sock *sk,
+						  struct udp_tunnel_sock_cfg *cfg)
+{
+	setup_udp_tunnel_sock(net, __builtin_choose_expr(
+		__builtin_types_compatible_p(typeof(&setup_udp_tunnel_sock),
+			void (*)(struct net *, struct sock *, struct udp_tunnel_sock_cfg *)),
+		sk, sk->sk_socket), cfg);
+}
+#define setup_udp_tunnel_sock(net, sk, cfg) __compat_setup_udp_tunnel_sock((net), (sk), (cfg))
+
+static inline void __compat_udp_tunnel_sock_release(struct sock *sk)
+{
+	udp_tunnel_sock_release(__builtin_choose_expr(
+		__builtin_types_compatible_p(typeof(&udp_tunnel_sock_release), void (*)(struct sock *)),
+		sk, sk->sk_socket));
+}
+#define udp_tunnel_sock_release(sk) __compat_udp_tunnel_sock_release(sk)
+"""
+with open(path, encoding="utf-8") as fh:
+	src = fh.read()
+if old in src:
+	with open(path, "w", encoding="utf-8") as fh:
+		fh.write(src.replace(old, new))
+	print("patched")
+PY
+		) || return 1
+		[ -z "$out" ] || ok "compat.h поправлен под бэкпорт udp_tunnel в ядре: $f"
+	done
+}
+
+# postinst amneziawg-dkms зовёт dkms build, и несобравшийся модуль оставляет пакет
+# недонастроенным — а с таким apt отказывается ставить вообще что угодно, и
+# фоллбэк на исходники падал на первом же apt-get install. Зовётся и после
+# удачной установки: модуль собрался под текущее ядро, но следующее может прийти
+# уже с бэкпортом, и тогда dkms споткнулся бы на нём после ребута.
+fix_dkms_pkg() {
+	patch_kmod_compat /usr/src/amneziawg-*/compat/compat.h
+	DEBIAN_FRONTEND=noninteractive dpkg --configure -a >/dev/null
+}
+
 install_from_repo() {
 	if $userspace; then
 		# метапакет amneziawg тянет за собой dkms, а он тут не нужен вовсе
@@ -286,7 +350,9 @@ install_from_repo() {
 		return
 	fi
 	install_headers
-	apt_install amneziawg amneziawg-dkms
+	apt_install amneziawg amneziawg-dkms ||
+		warn "apt упал — если на сборке модуля, правлю исходник и доконфигуриваю"
+	fix_dkms_pkg
 }
 
 # Запасной путь на случай, когда PPA недоступен или уехал: те же официальные
@@ -329,10 +395,11 @@ install_from_repo_debs() {
 		apt_install dkms perl
 		install_headers
 	fi
+	# повторный dpkg -i тут вреден: он заново распакует compat.h поверх правки
 	if ! dpkg -i "$dir"/*.deb >/dev/null 2>&1; then
 		DEBIAN_FRONTEND=noninteractive apt-get -f install -y >/dev/null 2>&1 || true
-		dpkg -i "$dir"/*.deb >/dev/null || die "пакеты из репо не встали, смотри dpkg -i вручную"
 	fi
+	fix_dkms_pkg || die "пакеты из репо не встали: dpkg --audit; dkms status"
 	ok "пакеты из репозитория niko-amwg: $series/$arch, $got шт."
 }
 
@@ -372,7 +439,13 @@ install_userspace_go() {
 
 install_from_source() {
 	step "сборка из исходников"
-	apt_install git build-essential pkg-config
+	# недонастроенный пакет из PPA держит apt в заложниках, а сборка его всё равно
+	# заменит: dkms-дерево amneziawg/1.0.0 у них одно
+	if dpkg --audit 2>/dev/null | grep -q amneziawg; then
+		dpkg --remove --force-remove-reinstreq amneziawg amneziawg-dkms >/dev/null 2>&1 || true
+	fi
+	apt_install git build-essential pkg-config ||
+		die "apt не ставит пакеты для сборки: dpkg --audit"
 	rm -rf "$tmp/tools" "$tmp/kmod"
 	git_clone "$TOOLS_REPO" "$tmp/tools"
 	make -C "$tmp/tools/src" -j"$(nproc)" >/dev/null || die "не собрались amneziawg-tools"
@@ -386,6 +459,7 @@ install_from_source() {
 	apt_install dkms
 	install_headers
 	git_clone "$KMOD_REPO" "$tmp/kmod"
+	patch_kmod_compat "$tmp/kmod/src/compat/compat.h"
 	dkms remove -m amneziawg -v 1.0.0 --all >/dev/null 2>&1 || true
 	make -C "$tmp/kmod/src" dkms-install >/dev/null || die "dkms-install не прошёл"
 	dkms add -m amneziawg -v 1.0.0 >/dev/null 2>&1 || true
@@ -943,7 +1017,11 @@ main() {
 		install_userspace_go
 	fi
 	if ! $from_source && ! versions_ok; then
-		warn "в репозитории версия старше $awg_version — собираю из исходников"
+		if ! $userspace && [ ! -e /sys/module/amneziawg ]; then
+			warn "модуль из пакета не собрался или не грузится под $(uname -r) — собираю из исходников"
+		else
+			warn "в репозитории версия старше $awg_version — собираю из исходников"
+		fi
 		warn "не пойдёт и сборка — есть --from-repo: пакеты из niko-amwg/debs"
 		install_from_source
 	fi
