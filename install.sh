@@ -343,6 +343,21 @@ fix_dkms_pkg() {
 	DEBIAN_FRONTEND=noninteractive dpkg --configure -a >/dev/null
 }
 
+# Хвост прошлого запуска: если тогда модуль не собрался, amneziawg-dkms висит
+# недонастроенным, и apt падает уже на базовых пакетах — до fix_dkms_pkg дело
+# не доходит. Python3 на убунте есть из коробки; нет — пакет проще снести, его
+# всё равно поставят заново ниже.
+heal_dpkg() {
+	dpkg --audit 2>/dev/null | grep -q amneziawg || return 0
+	warn "amneziawg-dkms недонастроен с прошлого раза — чиню до apt"
+	if command -v python3 >/dev/null 2>&1 && fix_dkms_pkg; then
+		return 0
+	fi
+	dpkg --remove --force-remove-reinstreq amneziawg amneziawg-dkms >/dev/null 2>&1 ||
+		die "не вышло ни доконфигурить, ни снести amneziawg-dkms: dpkg --audit"
+	warn "не доконфигурился — снёс, поставлю заново"
+}
+
 install_from_repo() {
 	if $userspace; then
 		# метапакет amneziawg тянет за собой dkms, а он тут не нужен вовсе
@@ -999,8 +1014,10 @@ main() {
 	if [ -r /etc/os-release ]; then . /etc/os-release; fi
 
 	step "базовые пакеты"
+	heal_dpkg
 	apt-get update -qq
-	apt_install ca-certificates curl gnupg iproute2 iptables qrencode python3 tar
+	apt_install ca-certificates curl gnupg iproute2 iptables qrencode python3 tar ||
+		die "apt не ставит базовые пакеты: dpkg --audit"
 	ok "${PRETTY_NAME:-${ID:-linux}}, ядро $(uname -r), $(dpkg --print-architecture)"
 
 	step "AmneziaWG $awg_version"
