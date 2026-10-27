@@ -72,6 +72,9 @@ TRAFFIC_FILE = os.path.join(STATE_DIR, "traffic.json")
 AWG = os.environ.get("AMWG_AWG_BIN", "awg")
 AWG_QUICK = os.environ.get("AMWG_AWG_QUICK_BIN", "awg-quick")
 AWG_GO = os.environ.get("AMWG_GO_BIN", "amneziawg-go")
+# Кладётся только ядерной установкой: по нему go без модуля отличается как
+# фоллбэк (модуль сломался), а не как осознанный --userspace
+ENSURE_UNIT = os.environ.get("AMWG_ENSURE_UNIT", "/etc/systemd/system/amwg-ensure-module.service")
 
 # Параметры обфускации, которые ОБЯЗАНЫ совпадать у сервера и клиента: копируются
 # в клиентский конфиг как есть. Список из README ядерного модуля — «All parameters
@@ -276,6 +279,10 @@ def backend() -> str:
     if shutil.which(AWG_GO):
         return "userspace"
     return "none"
+
+
+def kernel_intended() -> bool:
+    return os.path.exists(ENSURE_UNIT)
 
 
 def systemctl(*args: str, check: bool = True) -> str:
@@ -1420,9 +1427,16 @@ class Report:
 def check_module(rep: Report) -> None:
     release = os.uname().release
     kind = backend()
-    if kind == "userspace":
+    fallback = kind == "userspace" and kernel_intended()
+    if fallback:
+        # vpn живой, но работает не на том, на что ставили, — для мониторинга это
+        # поломка, иначе фоллбэк так и проживёт незамеченным до следующего ядра
+        rep.fail(f"ФОЛЛБЭК на amneziawg-go: модуль под ядро {release} не загружен",
+                 "клиенты работают, но медленнее; причина ниже и в systemctl status amwg-ensure-module")
+    elif kind == "userspace":
         rep.ok("бэкенд: amneziawg-go (userspace)",
                run([AWG_GO, "--version"], check=False).splitlines()[0].strip())
+    if kind == "userspace":
         if not os.path.exists("/dev/net/tun"):
             rep.fail("нет /dev/net/tun — go-реализации не на чем работать")
     elif kind == "kernel":
@@ -1444,7 +1458,7 @@ def check_module(rep: Report) -> None:
     else:
         rep.ok(f"amneziawg-tools {tools}")
 
-    if kind == "userspace":
+    if kind == "userspace" and not fallback:
         return              # dkms и заголовки ядра тут ни при чём
     if os.path.isdir(f"/lib/modules/{release}/build"):
         rep.ok("заголовки текущего ядра на месте")
@@ -1464,7 +1478,7 @@ def check_module(rep: Report) -> None:
 
 def check_units(rep: Report, state: dict) -> None:
     units = [(f"awg-quick@{state['iface']}.service", True), ("amwg-poll.timer", False)]
-    if backend() != "userspace":
+    if backend() != "userspace" or kernel_intended():
         # в userspace пересобирать под новое ядро нечего, юнита нет и не должно быть
         units.insert(1, ("amwg-ensure-module.service", False))
     for unit, needed in units:

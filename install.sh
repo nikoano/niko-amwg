@@ -25,6 +25,10 @@ readonly TOOLS_REPO="https://github.com/amnezia-vpn/amneziawg-tools.git"
 readonly KMOD_REPO="https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git"
 readonly GO_REPO="https://github.com/amnezia-vpn/amneziawg-go.git"
 readonly CONF_DIR="/etc/amnezia/amneziawg"
+# go-тулчейн с кэшем сборки — полгигабайта с лишним, а /tmp на свежих убунтах
+# tmpfs: на машине с гигом памяти сборка там просто не влезет
+readonly GO_WORK="/var/tmp/amwg-go-build"
+readonly ENSURE_UNIT="/etc/systemd/system/amwg-ensure-module.service"
 readonly H_BAND=536870910
 
 repo_raw="${AWG_REPO_RAW:-https://raw.githubusercontent.com/nikoano/niko-amwg/master}"
@@ -47,6 +51,7 @@ amwg_src="${AMWG_SRC:-}"
 from_source=false
 from_repo=false
 userspace=false
+fallback=false
 single_headers=false
 timings=true
 hold=true
@@ -135,7 +140,7 @@ while [ $# -gt 0 ]; do
 done
 
 tmp=$(mktemp -d /tmp/awg-install.XXXXXX)
-trap 'rm -rf "$tmp"' EXIT
+trap 'rm -rf "$tmp" "$GO_WORK"' EXIT
 
 script_dir=""
 if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
@@ -203,8 +208,9 @@ do_update() {
 	[ -f "$state" ] || die "тут ничего не установлено — нужна обычная установка, а не --update"
 	iface=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["iface"])' "$state") ||
 		die "не читается $state"
-	# бэкенд определяем по факту, чтобы положить правильный дроп-ин
-	if [ ! -e /sys/module/amneziawg ] && command -v amneziawg-go >/dev/null 2>&1; then
+	# Не по /sys/module: на фоллбэке модуля нет, а ставили под ядро, и ensure-module
+	# должен остаться. Юнит кладёт только ядерная установка — по нему и отличаем.
+	if [ ! -e "$ENSURE_UNIT" ] && command -v amneziawg-go >/dev/null 2>&1; then
 		userspace=true
 	fi
 	conf="$CONF_DIR/$iface.conf"
@@ -418,6 +424,33 @@ install_from_repo_debs() {
 	ok "пакеты из репозитория niko-amwg: $series/$arch, $got шт."
 }
 
+# Тулчейн берётся временный, с go.dev, и уходит вместе с $GO_WORK: бинарь
+# amneziawg-go статический, а держать на каждом сервере golang-go из apt плюс
+# докачанный им тулчейн в /root/go ради одной сборки — сотни мегабайт мусора.
+# Свой go на машине уже есть — берём его, GOTOOLCHAIN=auto доберёт версию сам.
+go_toolchain() {
+	if command -v go >/dev/null 2>&1; then
+		command -v go
+		return
+	fi
+	local arch meta url sum
+	arch=$(dpkg --print-architecture)
+	meta=$(curl -fsS --max-time 20 "https://go.dev/dl/?mode=json" | python3 -c '
+import json, sys
+rel = next(r for r in json.load(sys.stdin) if r["stable"])
+f = next(f for f in rel["files"]
+	if f["os"] == "linux" and f["arch"] == sys.argv[1] and f["kind"] == "archive")
+print(f["filename"], f["sha256"])
+' "$arch") || return 1
+	read -r url sum <<<"$meta"
+	curl -fsSL "https://go.dev/dl/$url" -o "$GO_WORK/go.tgz" || return 1
+	# закачку режут посередине — битый архив tar распаковал бы наполовину молча
+	echo "$sum  $GO_WORK/go.tgz" | sha256sum -c --quiet - || return 1
+	tar -C "$GO_WORK" -xzf "$GO_WORK/go.tgz" || return 1
+	rm -f "$GO_WORK/go.tgz"
+	echo "$GO_WORK/go/bin/go"
+}
+
 # Реализация на go: тот же протокол в обычном процессе. Готовых бинарей у
 # Amnezia нет (в репозитории go нет ни одного релиза), поэтому собираем из
 # исходников — это семь секунд и не тянет ничего, кроме компилятора. go.mod
@@ -442,14 +475,38 @@ git_clone() {
 
 install_userspace_go() {
 	step "amneziawg-go"
-	apt_install golang-go git
-	rm -rf "$tmp/go-src"
-	git_clone "$GO_REPO" "$tmp/go-src"
-	( cd "$tmp/go-src" && GOTOOLCHAIN=auto GOFLAGS=-buildvcs=false \
-		go build -o "$tmp/amneziawg-go" . ) >/dev/null 2>&1 ||
+	local gobin
+	apt_install git || die "apt не ставит git"
+	rm -rf "$GO_WORK"
+	install -d -m 0700 "$GO_WORK"
+	gobin=$(go_toolchain) || die "не скачался go-тулчейн с go.dev"
+	git_clone "$GO_REPO" "$GO_WORK/src"
+	( cd "$GO_WORK/src" && GOPATH="$GO_WORK/gopath" GOCACHE="$GO_WORK/cache" \
+		GOTOOLCHAIN=auto GOFLAGS="-buildvcs=false -modcacherw" \
+		"$gobin" build -o "$GO_WORK/amneziawg-go" . ) >/dev/null 2>&1 ||
 		die "amneziawg-go не собрался (нужен доступ к proxy.golang.org)"
-	install -m 0755 "$tmp/amneziawg-go" /usr/local/bin/amneziawg-go
+	install -m 0755 "$GO_WORK/amneziawg-go" /usr/local/bin/amneziawg-go
+	rm -rf "$GO_WORK"
 	ok "amneziawg-go: /usr/local/bin/amneziawg-go ($(amneziawg-go --version 2>&1 | head -1))"
+}
+
+kernel_module_ok() {
+	modprobe amneziawg 2>/dev/null || true
+	[ -e /sys/module/amneziawg ]
+}
+
+# Запасной бэкенд при ядерной установке. Переключать на загрузке ничего не надо:
+# awg-quick сам уходит на amneziawg-go, если `ip link add type amneziawg` не
+# прошёл, а бинарь лежит в PATH, — и сам же вернётся на ядро, когда модуль
+# соберётся. Конфиг один и тот же, клиенты разницы не видят.
+install_fallback_go() {
+	if command -v amneziawg-go >/dev/null 2>&1; then
+		info "запасной amneziawg-go уже стоит"
+		return 0
+	fi
+	( install_userspace_go ) && return 0
+	warn "запасной amneziawg-go не собрался — сломается модуль, и vpn ляжет"
+	return 1
 }
 
 install_from_source() {
@@ -622,6 +679,9 @@ depmod -a 2>/dev/null || true
 
 if ! modprobe amneziawg 2>&1; then
 	echo "модуль не грузится под текущее ядро $(uname -r)" >&2
+	if command -v amneziawg-go >/dev/null 2>&1; then
+		echo "ФОЛЛБЭК: awg-quick поднимет интерфейс на amneziawg-go — медленнее, клиенты те же" >&2
+	fi
 	echo "смотреть: dkms status; /var/lib/dkms/amneziawg/*/$(uname -r)/log/make.log" >&2
 	exit 1
 fi
@@ -981,7 +1041,7 @@ summary() {
 $(printf '%s' "$c_green")Готово.$(printf '%s' "$c_off")
 
   сервер        $endpoint:$port/udp, интерфейс $iface, подсеть $subnet
-  реализация    $(if $userspace; then echo "amneziawg-go (userspace)"; else echo "ядерный модуль"; fi)
+  реализация    $(if $fallback; then echo "amneziawg-go — ФОЛЛБЭК, модуль под $(uname -r) не встал (amwg check)"; elif $userspace; then echo "amneziawg-go (userspace)"; else echo "ядерный модуль, запасной — $(command -v amneziawg-go >/dev/null 2>&1 && echo amneziawg-go || echo нет)"; fi)
   конфиг        $conf
   клиенты       $CONF_DIR/amwg/state.json (ключи, 0600)
   трафик        $CONF_DIR/amwg/traffic.json, копит amwg-poll.timer
@@ -1021,8 +1081,10 @@ main() {
 	ok "${PRETTY_NAME:-${ID:-linux}}, ядро $(uname -r), $(dpkg --print-architecture)"
 
 	step "AmneziaWG $awg_version"
+	# сборка из исходников — в сабшелле: её die не должен валить установку, пока
+	# есть запасной amneziawg-go; на что вышли в итоге, решается ниже
 	if $from_source; then
-		install_from_source
+		( install_from_source ) || warn "сборка из исходников не прошла"
 	elif $from_repo; then
 		install_from_repo_debs "$(pick_series)"
 	else
@@ -1040,14 +1102,24 @@ main() {
 			warn "в репозитории версия старше $awg_version — собираю из исходников"
 		fi
 		warn "не пойдёт и сборка — есть --from-repo: пакеты из niko-amwg/debs"
-		install_from_source
+		( install_from_source ) || warn "сборка из исходников не прошла"
+	fi
+	if ! $userspace; then
+		install_fallback_go || true
+		if ! kernel_module_ok && command -v amneziawg-go >/dev/null 2>&1; then
+			warn "модуль ядра так и не встал под $(uname -r) — поднимаю на amneziawg-go"
+			warn "это медленнее, но конфиги клиентов те же; почему: dkms status; journalctl -k | tail"
+			warn "соберётся модуль (новый пакет, другое ядро) — awg-quick сам вернётся на ядро"
+			fallback=true
+			userspace=true
+		fi
 	fi
 	if $hold && ! $from_source; then
 		apt-mark hold amneziawg amneziawg-dkms amneziawg-tools >/dev/null 2>&1 &&
 			info "версии зафиксированы (apt-mark unhold — снять)"
 	fi
 	check_versions
-	if $userspace; then
+	if $userspace && ! $fallback; then
 		info "ensure-module не нужен: пересобирать под новое ядро нечего"
 	else
 		install_ensure_module
